@@ -50,48 +50,71 @@ class CoreferenceDataset(Dataset):
                 word_to_subwords[word_id].append(subword_idx)
 
         # Process coreference clusters
-        clusters = defaultdict(list)
+        cluster_id_map = {}
+        numeric_clusters = defaultdict(list)
+        cluster_counter = 0
         for mention in example["mentions"]:
             start_word = mention["start"]
             end_word = mention["end"]
-            cluster_id = mention["cluster"]
+            cluster_str = mention["cluster"]
+
+            if cluster_str not in cluster_id_map:
+                cluster_id_map[cluster_str] = cluster_counter
+                cluster_counter += 1
+
+            numeric_cluster = cluster_id_map[cluster_str]
 
             # Convert word spans to subword spans
             subword_start = word_to_subwords[start_word][0] if start_word in word_to_subwords else -1
             subword_end = word_to_subwords[end_word - 1][-1] if (end_word - 1) in word_to_subwords else -1
 
             if subword_start != -1 and subword_end != -1:
-                clusters[cluster_id].append((subword_start, subword_end))
+                numeric_clusters[numeric_cluster].append((subword_start, subword_end))
 
         # Process dependency edges
         edge_list = []
         for edge in example["edges"]:
-            source = edge["source"]
-            target = edge["target"]
+            source_word = edge["source"]
+            target_word = edge["target"]
             label = edge["label"]
 
-            # Convert edge labels to IDs if needed
-            edge_list.append((
-                torch.tensor(source, dtype=torch.long),
-                torch.tensor(target, dtype=torch.long),
-                torch.tensor(self.label2id.get(label, 0))  # Handle unknown labels
-                             ))
+            if source_word in word_to_subwords and target_word in word_to_subwords:
+                source_subword = word_to_subwords[source_word][0]  # First subword of source
+                target_subword = word_to_subwords[target_word][0]  # First subword of target
+
+                edge_list.append((
+                    torch.tensor(source_subword, dtype=torch.long),
+                    torch.tensor(target_subword, dtype=torch.long),
+                    torch.tensor(self.label2id.get(label, 0))
+                ))
+
+        span_starts = []
+        span_ends = []
+        cluster_ids = []
+
+        for cid, mentions in numeric_clusters.items():
+            for (s, e) in mentions:
+                span_starts.append(s)
+                span_ends.append(e)
+                cluster_ids.append(cid)
 
         return {
             "input_ids": tokenized["input_ids"].squeeze(0),
             "attention_mask": tokenized["attention_mask"].squeeze(0),
-            "clusters": clusters,
+            "clusters": numeric_clusters,
             "edges": edge_list,
+            "span_starts": torch.tensor(span_starts),
+            "span_ends": torch.tensor(span_ends),
+            "cluster_ids": torch.tensor(cluster_ids),
             "lang": example["lang"]
         }
-
 
 def collate_fn(batch):
     padded_batch = {
         "input_ids": torch.nn.utils.rnn.pad_sequence(
             [item["input_ids"] for item in batch],
             batch_first=True,
-            padding_value=1  # XLMR pad token
+            padding_value=1  # XLM-RoBERTa pad token ID
         ),
         "attention_mask": torch.nn.utils.rnn.pad_sequence(
             [item["attention_mask"] for item in batch],
@@ -100,6 +123,9 @@ def collate_fn(batch):
         ),
         "clusters": [item["clusters"] for item in batch],
         "edges": [item["edges"] for item in batch],
+        "span_starts": [item["span_starts"] for item in batch],
+        "span_ends": [item["span_ends"] for item in batch],
+        "cluster_ids": [item["cluster_ids"] for item in batch],
         "langs": [item["lang"] for item in batch]
     }
     return padded_batch

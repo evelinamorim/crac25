@@ -109,26 +109,51 @@ class CoreferenceDataset(Dataset):
             "lang": example["lang"]
         }
 
+from torch.nn.utils.rnn import pad_sequence
+import torch
+
 def collate_fn(batch):
-    padded_batch = {
-        "input_ids": torch.nn.utils.rnn.pad_sequence(
+    # Convert edges, spans, and cluster_ids to tensors and pad them
+    processed = {
+        "input_ids": pad_sequence(
             [item["input_ids"] for item in batch],
             batch_first=True,
             padding_value=1  # XLM-RoBERTa pad token ID
         ),
-        "attention_mask": torch.nn.utils.rnn.pad_sequence(
+        "attention_mask": pad_sequence(
             [item["attention_mask"] for item in batch],
             batch_first=True,
             padding_value=0
         ),
+        # Convert edges to tensors and pad
+        "edges": pad_sequence(
+            [torch.tensor(item["edges"], dtype=torch.long) for item in batch],
+            batch_first=True,
+            padding_value=-100  # Use a padding value your model can ignore
+        ),
+        # Convert span starts/ends to tensors and pad
+        "span_starts": pad_sequence(
+            [item["span_starts"] for item in batch],
+            batch_first=True,
+            padding_value=-100
+        ),
+        "span_ends": pad_sequence(
+            [item["span_ends"] for item in batch],
+            batch_first=True,
+            padding_value=-100
+        ),
+        # Convert cluster IDs to tensors and pad
+        "cluster_ids": pad_sequence(
+            [item["cluster_ids"] for item in batch],
+            batch_first=True,
+            padding_value=-100
+        ),
+        # Non-tensor fields (keep as lists)
         "clusters": [item["clusters"] for item in batch],
-        "edges": [item["edges"] for item in batch],
-        "span_starts": [item["span_starts"] for item in batch],
-        "span_ends": [item["span_ends"] for item in batch],
-        "cluster_ids": [item["cluster_ids"] for item in batch],
         "langs": [item["lang"] for item in batch]
     }
-    return padded_batch
+
+    return processed
 
 
 

@@ -72,7 +72,9 @@ def conllu_to_json(f: str, doc: udapi.Document):
     json_graphs = []
 
     for bundle in doc.bundles:
+
         tree = bundle.get_tree()
+
         surface_nodes = list(tree.descendants)
         empty_nodes = list(tree.empty_nodes)
         all_nodes = surface_nodes + empty_nodes
@@ -123,6 +125,8 @@ def conllu_to_json(f: str, doc: udapi.Document):
             "pos": pos,                 # Surface POS tags
             "edges": edges,             # Graph edges over all nodes
             "mentions": mentions,       # Only from surface tokens
+            "sent_id": bundle.bundle_id,
+            "doc_key": doc.meta["docname"],
             "lang": detect_lang_from_filename(f)
         })
 
@@ -134,7 +138,7 @@ def read_data(data_dir:str):
     data_lst = []
     file_lst = os.listdir(data_dir)
     for f in file_lst:
-        if f.endswith(".conllu"):
+        if f.endswith("hu_korkor-corefud-minidev.conllu"):
             print(f"Reading {f}")
             doc = udapi.Document(os.path.join(data_dir, f))
             data_lst.append((f, doc))
@@ -143,8 +147,8 @@ def read_data(data_dir:str):
 
 def main():
 
-    data_dir = "../data/unc-gold-train"
-    output_dir = "../data/unc-gold-train-json"
+    data_dir = "../data/unc-gold-minidev"
+    output_dir = "../data/unc-gold-minidev"
 
     doc_lst = read_data(data_dir)
     for f, doc in doc_lst:
@@ -152,6 +156,7 @@ def main():
         json_filename = os.path.join(output_dir, f.replace('.conllu', '.json'))
         with open(json_filename, 'w') as out_f:
             json.dump(json_output, out_f, indent=2, ensure_ascii=False)
+        break
 
 if __name__ == "__main__":
     main()

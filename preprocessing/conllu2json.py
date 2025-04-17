@@ -69,9 +69,15 @@ def detect_lang_from_filename(filename:str):
 
 def conllu_to_json(f: str, doc: udapi.Document):
 
-    json_graphs = []
+    doc_key = doc.meta["docname"]
+    sentence_starts = []
+    all_tokens = []
+    all_pos = []
+    sentence_map = []
+    mentions_by_cluster = defaultdict(list)
 
-    for bundle in doc.bundles:
+    token_offset = 0
+    for sentence_idx, bundle in enumerate(doc.bundles):
 
         tree = bundle.get_tree()
 
@@ -83,13 +89,16 @@ def conllu_to_json(f: str, doc: udapi.Document):
         tokens = [node.form for node in surface_nodes]
         pos = [node.upos for node in surface_nodes]
 
+        all_tokens.extend(tokens)
+        all_pos.extend(pos)
+        sentence_map.extend([sentence_idx] * len(tokens))
+
         # Indexing: ord (e.g., "3", "4.1") -> position in `all_nodes`
         ord_to_index = {}
         for idx, node in enumerate(all_nodes):
             ord_to_index[str(node.ord)] = idx
 
         # Coreference info (only for surface tokens!)
-        mentions = []
         open_mentions = defaultdict(list)
         for i, node in enumerate(surface_nodes):
             misc = node.misc
@@ -97,15 +106,16 @@ def conllu_to_json(f: str, doc: udapi.Document):
                 actions = extract_cluster_ids(misc['Entity'])
                 for action in actions:
                     if action["type"] == "start":
-                        open_mentions[action["cluster"]].append(i)
+                        open_mentions[action["cluster"]].append(i + token_offset)
                     elif action["type"] == "end":
                         if open_mentions[action["cluster"]]:
                             start = open_mentions[action["cluster"]].pop()
-                            mentions.append({
-                                "start": start,
-                                "end": i,
-                                "cluster": action["cluster"]
-                            })
+                            end = i + token_offset
+                            mentions_by_cluster[action["cluster"]].append((start, end))
+
+        token_offset += len(tokens)
+
+        clusters = list(mentions_by_cluster.values())
 
         # Build edge list (using all_nodes and ord_to_index)
         edges = []
@@ -120,17 +130,11 @@ def conllu_to_json(f: str, doc: udapi.Document):
                         "label": node.deprel
                     })
 
-        json_graphs.append({
-            "tokens": tokens,           # Surface tokens for XLM-R
-            "pos": pos,                 # Surface POS tags
-            "edges": edges,             # Graph edges over all nodes
-            "mentions": mentions,       # Only from surface tokens
-            "sent_id": bundle.bundle_id,
-            "doc_key": doc.meta["docname"],
-            "lang": detect_lang_from_filename(f)
-        })
+        json_output = {"doc_key": doc_key, "tokens": all_tokens, "pos": all_pos, "clusters": clusters,
+                       "sentence_map": sentence_map, "sentence_starts": sentence_starts,
+                       "lang": detect_lang_from_filename(f), }
 
-    return json_graphs
+    return json_output
 
 
 

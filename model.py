@@ -15,6 +15,7 @@ from collections import defaultdict
 
 import torch
 from torch import nn
+import  torch.nn.functional as F
 from transformers import XLMRobertaModel, XLMRobertaTokenizer
 
 
@@ -57,7 +58,13 @@ class GCNLayer(nn.Module):
             source=transformed
         )
 
+        degree = torch.zeros(batch_size * seq_len, device=device)
+        degree.index_add_(0, flat_indices, torch.ones_like(flat_indices, dtype=torch.float))
+        degree = degree.clamp(min=1).view(batch_size, seq_len, 1)
+
         out = out_flat.view(batch_size, seq_len, hidden_dim)
+        out = out / degree
+
         return self.relu(out)
 
 
@@ -120,6 +127,7 @@ class XLMRCorefModel(nn.Module):
 
         self.antecedent_scorer = nn.Linear(hidden_size * 6, 1)
         self.dropout = nn.Dropout(0.1)
+        # TODO: incoporate this in future
         self.span_width_emb = nn.Embedding(self.span_width, hidden_size)
 
     def generate_candidate_spans(self, embeddings):
@@ -178,8 +186,47 @@ class XLMRCorefModel(nn.Module):
             gold_clusters.append(list(clusters.values()))
         return gold_clusters
 
+    def create_sentence_mask(self, pruned_idx, spans, sentence_map, sentence_starts, max_sentence_distance=3):
+        """
+        Create mask to constrain antecedent search based on sentence distance.
+
+        Args:
+            pruned_idx: indices of pruned spans
+            spans: all candidate spans for this document
+            sentence_map: tensor mapping each token to sentence ID
+            sentence_starts: tensor of sentence start positions
+            max_sentence_distance: maximum allowed sentence distance for antecedents
+
+        Returns:
+            mask: boolean tensor (num_spans, num_spans+1) where True = mask out
+        """
+        num_spans = len(pruned_idx)
+        # +1 for dummy antecedent column
+        mask = torch.zeros(num_spans, num_spans + 1, dtype=torch.bool, device=sentence_map.device)
+
+        # Get sentence IDs for each pruned span
+        span_sentences = []
+        for idx in pruned_idx:
+            span_start, span_end = spans[idx]
+            # Use sentence of the span's head token (or start token)
+            span_sent_id = sentence_map[span_start].item()
+            span_sentences.append(span_sent_id)
+
+        # Create sentence distance mask
+        for i in range(num_spans):  # for each mention
+            mention_sent = span_sentences[i]
+            for j in range(num_spans):  # for each potential antecedent
+                antecedent_sent = span_sentences[j]
+
+                # Mask if antecedent is too far back in sentences
+                if mention_sent - antecedent_sent > max_sentence_distance:
+                    mask[i, j + 1] = True  # +1 because of dummy column
+
+        return mask
+
     def forward(self, input_ids, attention_mask=None,edges=None,
-                span_starts=None, span_ends=None, cluster_ids=None):
+                span_starts=None, span_ends=None, cluster_ids=None,
+                sentence_map=None, sentence_starts=None):
         """
         Forward pass through XLM-RoBERTa model
         Args:
@@ -190,6 +237,7 @@ class XLMRCorefModel(nn.Module):
             output: Hidden states (embeddings) from XLM-RoBERTa model
         """
         output = self.xlm_roberta(input_ids=input_ids, attention_mask=attention_mask) # (batch_size, seq_len, hidden_size)
+
 
         if edges is not None:
 
@@ -231,7 +279,15 @@ class XLMRCorefModel(nn.Module):
                     triu_mask
                 ], dim=1)
 
-                masked_scores = ant_scores_with_dummy.masked_fill(triu_mask_extended.bool(), -1e10)
+                # Create sentence - based mask
+                sentence_mask = self.create_sentence_mask(
+                    pruned_indices[i], all_spans[i], sentence_map[i], sentence_starts[i]
+                )
+
+                # Combine both masks: triangular + sentence constraints
+                combined_mask = triu_mask_extended.bool() | sentence_mask
+
+                masked_scores = ant_scores_with_dummy.masked_fill(combined_mask, -1e10)
 
                 # Apply regular softmax
                 softmaxed_scores = torch.nn.functional.softmax(masked_scores, dim=-1)
@@ -241,42 +297,56 @@ class XLMRCorefModel(nn.Module):
                 antecedent_scores_list.append(ant_scores)
 
         if self.training:
-            # only if is training I compute the loss
-            gold_clusters = self.extract_gold_clusters(span_starts, span_ends, cluster_ids)
-            gold_antecedents_list = []
-            for i, pruned_idxs in enumerate(pruned_indices):
-                candidate_spans = all_spans[i]
-                spans = [candidate_spans[idx] for idx in pruned_idxs]
-                span_to_index = {span: j for j, span in enumerate(spans)}
+            mention_loss = self.compute_mention_loss(mention_scores, span_starts, span_ends, cluster_ids, all_spans)
 
-                gold_antecedents = []
-                cluster = gold_clusters[i]
-                span_cluster_map = {}
-                for cluster_spans in cluster:
-                    for span in cluster_spans:
-                        span_cluster_map[span] = cluster_spans
+            relation_loss = self.compute_coref_training_loss(
+                span_starts,
+                span_ends,
+                cluster_ids,
+                pruned_indices,
+                all_spans,
+                antecedent_scores_list
+            )
 
-                for j, span in enumerate(spans):
-                    ant_indices = []
-                    if span in span_cluster_map:
-                        for ant in span_cluster_map[span]:
-                            if ant == span:
-                                break  # Only consider previous mentions
-                            if ant in span_to_index:
-                                ant_indices.append(span_to_index[ant])
-                    gold_antecedents.append(ant_indices)
-                gold_antecedents_list.append(gold_antecedents)
-
-            coref_losses = []
-            for i, ant_scores in enumerate(antecedent_scores_list):
-                coref_loss = self.compute_coref_loss(ant_scores, gold_antecedents_list[i])
-                coref_losses.append(coref_loss)
-
-            avg_loss = torch.stack(coref_losses).mean()
-
-            return avg_loss
+            return relation_loss + mention_loss
         else:
             return antecedent_scores_list, pruned_indices, all_spans
+
+    def compute_coref_training_loss(self, span_starts, span_ends, cluster_ids, pruned_indices, all_spans, antecedent_scores_list):
+
+        gold_clusters = self.extract_gold_clusters(span_starts, span_ends, cluster_ids)
+        gold_antecedents_list = []
+        for i, pruned_idxs in enumerate(pruned_indices):
+            candidate_spans = all_spans[i]
+            spans = [candidate_spans[idx] for idx in pruned_idxs]
+            span_to_index = {span: j for j, span in enumerate(spans)}
+
+            gold_antecedents = []
+            cluster = gold_clusters[i]
+            span_cluster_map = {}
+            for cluster_spans in cluster:
+                for span in cluster_spans:
+                    span_cluster_map[span] = cluster_spans
+
+            for j, span in enumerate(spans):
+                ant_indices = []
+                if span in span_cluster_map:
+                    for ant in span_cluster_map[span]:
+                        if ant == span:
+                            break  # Only consider previous mentions
+                        if ant in span_to_index:
+                            ant_indices.append(span_to_index[ant])
+                gold_antecedents.append(ant_indices)
+            gold_antecedents_list.append(gold_antecedents)
+
+        coref_losses = []
+        for i, ant_scores in enumerate(antecedent_scores_list):
+            coref_loss = self.compute_coref_loss(ant_scores, gold_antecedents_list[i])
+            coref_losses.append(coref_loss)
+
+        avg_loss = torch.stack(coref_losses).mean()
+
+        return avg_loss
 
     def compute_coref_loss(self, antecedent_scores, gold_antecedents):
         loss = 0.0
@@ -291,6 +361,61 @@ class XLMRCorefModel(nn.Module):
             gold_log_sum_exp = torch.logsumexp(gold_scores, dim=0)
             loss += log_sum_exp - gold_log_sum_exp
         return loss / max(len(antecedent_scores), 1)  # Normalize by number of spans
+
+    def create_mention_labels(self, num_spans, span_starts, span_ends, cluster_ids, all_spans):
+        """
+        Create binary labels for mention detection.
+
+        Args:
+            num_spans: total number of candidate spans
+            span_starts: tensor of gold mention start positions
+            span_ends: tensor of gold mention end positions
+            cluster_ids: tensor of cluster IDs for gold mentions
+            all_spans: list of all candidate spans [(start, end), ...]
+
+        Returns:
+            labels: tensor of shape (num_spans,) with 1 for mentions, 0 for non-mentions
+        """
+        labels = torch.zeros(num_spans, dtype=torch.float)
+
+        # Create set of gold mention spans for fast lookup
+        gold_spans = set()
+        for start, end, cluster_id in zip(span_starts, span_ends, cluster_ids):
+            if cluster_id != -1:  # -1 typically means not a mention
+                gold_spans.add((start.item(), end.item()))
+
+        # Mark candidate spans that match gold mentions
+        for i, (start, end) in enumerate(all_spans):
+            if (start, end) in gold_spans:
+                labels[i] = 1.0
+
+        return labels
+
+    def compute_mention_loss(self, mention_scores_list, span_starts, span_ends, cluster_ids, all_spans):
+        """Compute loss for mention detection"""
+        mention_losses = []
+
+        for i, mention_scores in enumerate(mention_scores_list):
+            # Create gold mention labels
+            gold_mentions = self.create_mention_labels(
+                len(mention_scores),
+                span_starts[i],
+                span_ends[i],
+                cluster_ids[i],
+                all_spans[i]
+            )
+
+            # Move to same device as mention_scores
+            gold_mentions = gold_mentions.to(mention_scores.device)
+
+            # Binary cross-entropy loss
+            mention_loss = F.binary_cross_entropy_with_logits(
+                mention_scores.squeeze(-1), gold_mentions
+            )
+            mention_losses.append(mention_loss)
+
+        return torch.stack(mention_losses).mean()
+
 
     @torch.no_grad()
     def predict(self, input_ids, attention_mask, edges):

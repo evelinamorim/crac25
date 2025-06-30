@@ -23,7 +23,7 @@ class CoreferenceDataset(Dataset):
         for path in file_paths:
             with open(path, 'r') as f:
                 data = json.load(f)
-                combined_data.extend(data)
+                combined_data.append(data)
         return combined_data
 
     def __len__(self):
@@ -50,26 +50,15 @@ class CoreferenceDataset(Dataset):
                 word_to_subwords[word_id].append(subword_idx)
 
         # Process coreference clusters
-        cluster_id_map = {}
         numeric_clusters = defaultdict(list)
-        cluster_counter = 0
-        for mention in example["mentions"]:
-            start_word = mention["start"]
-            end_word = mention["end"]
-            cluster_str = mention["cluster"]
+        for cid, cluster in enumerate(example["clusters"]):
+            for start_word, end_word in cluster:
 
-            if cluster_str not in cluster_id_map:
-                cluster_id_map[cluster_str] = cluster_counter
-                cluster_counter += 1
+                subword_start = word_to_subwords[start_word][0] if (start_word in word_to_subwords) else -1
+                subword_end = word_to_subwords[end_word][-1] if (end_word in word_to_subwords) else -1
 
-            numeric_cluster = cluster_id_map[cluster_str]
-
-            # Convert word spans to subword spans
-            subword_start = word_to_subwords[start_word][0] if start_word in word_to_subwords else -1
-            subword_end = word_to_subwords[end_word - 1][-1] if (end_word - 1) in word_to_subwords else -1
-
-            if subword_start != -1 and subword_end != -1:
-                numeric_clusters[numeric_cluster].append((subword_start, subword_end))
+                if subword_start != -1 and subword_end != -1:
+                    numeric_clusters[cid].append((subword_start, subword_end))
 
         # Process dependency edges
         edge_list = []
@@ -106,6 +95,8 @@ class CoreferenceDataset(Dataset):
             "span_starts": torch.tensor(span_starts),
             "span_ends": torch.tensor(span_ends),
             "cluster_ids": torch.tensor(cluster_ids),
+            "sentence_map": torch.tensor(example.get("sentence_map")),
+            "sentence_starts": torch.tensor(example.get("sentence_starts")),
             "lang": example["lang"]
         }
 
@@ -147,6 +138,16 @@ def collate_fn(batch):
             [item["cluster_ids"] for item in batch],
             batch_first=True,
             padding_value=-100
+        ),
+        "sentence_map": pad_sequence(
+            [item["sentence_map"] for item in batch],
+            batch_first=True,
+            padding_value=0
+        ),
+        "sentence_starts":pad_sequence(
+            [item["sentence_starts"] for item in batch],
+            batch_first=True,
+            padding_value=0
         ),
         # Non-tensor fields (keep as lists)
         "clusters": [item["clusters"] for item in batch],

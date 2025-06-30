@@ -82,6 +82,7 @@ def conllu_to_json(f: str, doc: udapi.Document):
         tree = bundle.get_tree()
 
         surface_nodes = list(tree.descendants)
+        sentence_starts.append(len(all_tokens))
         empty_nodes = list(tree.empty_nodes)
         all_nodes = surface_nodes + empty_nodes
 
@@ -132,35 +133,34 @@ def conllu_to_json(f: str, doc: udapi.Document):
 
         json_output = {"doc_key": doc_key, "tokens": all_tokens, "pos": all_pos, "clusters": clusters,
                        "sentence_map": sentence_map, "sentence_starts": sentence_starts,
-                       "lang": detect_lang_from_filename(f), }
+                       "edges":edges,
+                       "lang": detect_lang_from_filename(f)}
 
     return json_output
 
 
 
-def read_data(data_dir:str):
+def process_data(data_dir:str, output_dir:str):
     data_lst = []
     file_lst = os.listdir(data_dir)
     for f in file_lst:
-        if f.endswith("hu_korkor-corefud-minidev.conllu"):
+        if f.endswith(".conllu"):
             print(f"Reading {f}")
             doc = udapi.Document(os.path.join(data_dir, f))
-            data_lst.append((f, doc))
-            break
-    return data_lst
+            json_output = conllu_to_json(f, doc)
+            json_filename = os.path.join(output_dir, f.replace('.conllu', '.json'))
+            with open(json_filename, 'w') as out_f:
+                print(f"Writing {json_filename}")
+                json.dump(json_output, out_f, indent=2, ensure_ascii=False)
+
 
 def main():
 
-    data_dir = "../data/unc-gold-minidev"
-    output_dir = "../data/unc-gold-minidev"
+    data_dir = "../data/unc-gold-train"
+    output_dir = "../data/unc-gold-train-json"
 
-    doc_lst = read_data(data_dir)
-    for f, doc in doc_lst:
-        json_output = conllu_to_json(f, doc)
-        json_filename = os.path.join(output_dir, f.replace('.conllu', '.json'))
-        with open(json_filename, 'w') as out_f:
-            json.dump(json_output, out_f, indent=2, ensure_ascii=False)
-        break
+    process_data(data_dir, output_dir)
+
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,6 @@
 #This will include:
 from collections import defaultdict
+from bisect import bisect_left
 
 #XLM-R for contextual embeddings
 
@@ -130,40 +131,63 @@ class XLMRCorefModel(nn.Module):
         # TODO: incoporate this in future
         self.span_width_emb = nn.Embedding(self.span_width, hidden_size)
 
-    def generate_candidate_spans(self, embeddings):
+    def generate_candidate_spans(self, embeddings, attention_mask):
         batch_size, seq_len, _ = embeddings.size()
-        return [
-            [(i, j) for i in range(seq_len)
-             for j in range(i, min(i + self.span_width, seq_len))]
-            for _ in range(batch_size)
-        ]
+
+        all_spans = []
+        for b in range(batch_size):
+
+
+            # Use attention_mask to get actual sequence length
+            if attention_mask is not None:
+                actual_len = attention_mask[b].sum().item()
+            else:
+                actual_len = seq_len
+
+            for i in range(actual_len):
+                for j in range(i + 1, min(i + self.span_width, actual_len)):
+                    all_spans.append((i, j))
+
+        return all_spans
 
     def prune_spans(self, span_reps, mention_scores, topk_per_doc):
         """
         Args:
-            span_reps: list of (num_spans_i, span_dim) tensors
-            mention_scores: list of (num_spans_i,) tensors
-            topk_per_doc: tensor of shape (batch_size,) with topk per doc
+            span_reps: (num_spans, span_dim) tensor (since you're using torch.stack now)
+            mention_scores: (num_spans,) tensor
+            topk_per_doc: scalar tensor or int with topk value
         """
-        pruned_span_reps = []
-        pruned_scores = []
-        pruned_indices = []
+        # Handle the case where topk_per_doc might be a scalar tensor or int
+        if isinstance(topk_per_doc, torch.Tensor):
+            if topk_per_doc.dim() == 0:  # scalar tensor
+                k = min(topk_per_doc.item(), mention_scores.size(0))
+            else:  # tensor with dimensions
+                k = min(topk_per_doc[0].item(), mention_scores.size(0))
+        else:  # regular int/float
+            k = min(topk_per_doc, mention_scores.size(0))
 
-        for i, (reps, scores) in enumerate(zip(span_reps, mention_scores)):
-            k = min(topk_per_doc[i].item(), scores.size(0))
-            topk_scores, topk_indices = torch.topk(scores, k)
-            pruned_span_reps.append(reps[topk_indices])
-            pruned_scores.append(topk_scores)
-            pruned_indices.append(topk_indices)
+        topk_scores, topk_indices = torch.topk(mention_scores, k)
+        pruned_span_reps = span_reps[topk_indices]
+        pruned_scores = topk_scores
+        pruned_indices = topk_indices
 
         return pruned_span_reps, pruned_scores, pruned_indices
 
     def get_antecedent_scores(self, span_reps):
         """Score all pairs of spans"""
-        # Expand to all pairwise combinations
+        if span_reps.dim() == 1:
+            span_reps = span_reps.unsqueeze(0)
+
         num_spans = span_reps.size(0)
-        cated = torch.cat([span_reps.unsqueeze(0).expand(num_spans, -1, -1),
-                           span_reps.unsqueeze(1).expand(-1, num_spans, -1)], dim=-1)
+
+        if num_spans == 1:
+            # Special case: single span
+            pair = torch.cat([span_reps, span_reps], dim=-1)
+            return self.antecedent_scorer(pair).view(1, 1)
+
+        # Multiple spans case
+        cated = torch.cat([span_reps.unsqueeze(1).expand(-1, num_spans, -1),
+                           span_reps.unsqueeze(0).expand(num_spans, -1, -1)], dim=-1)
 
         return self.antecedent_scorer(cated).squeeze(-1)
 
@@ -200,6 +224,9 @@ class XLMRCorefModel(nn.Module):
         Returns:
             mask: boolean tensor (num_spans, num_spans+1) where True = mask out
         """
+
+
+
         num_spans = len(pruned_idx)
         # +1 for dummy antecedent column
         mask = torch.zeros(num_spans, num_spans + 1, dtype=torch.bool, device=sentence_map.device)
@@ -250,12 +277,13 @@ class XLMRCorefModel(nn.Module):
             else:
                 raise ValueError("Invalid combine_strategy. Choose 'add' or 'concat'.")
 
-            # Generate candidate spans (include gold mentions!)
-            all_spans = self.generate_candidate_spans(embeddings)
+            all_spans = self.generate_candidate_spans(embeddings, attention_mask)
+
             # Get span representations
             span_reps = self.span_repr(embeddings, all_spans)
             # Calculate mention scores
             mention_scores = self.mention_scorer(span_reps)
+
             seq_lens = attention_mask.sum(dim=1)
             topk_per_doc = (seq_lens.float() * 0.4).long()
 
@@ -265,88 +293,80 @@ class XLMRCorefModel(nn.Module):
 
             antecedent_scores_list = []
 
-            for i in range(len(pruned_span_reps)):
-                pruned_span_rep = pruned_span_reps[i]  # (topk, 3 * hidden)
-                ant_scores = self.get_antecedent_scores(pruned_span_rep)  # (topk, topk)
+            ant_scores = self.get_antecedent_scores(pruned_span_reps)  # (topk, topk)
 
-                dummy_scores = torch.zeros(pruned_span_rep.size(0), 1, device=pruned_span_rep.device)
-                ant_scores_with_dummy = torch.cat([dummy_scores, ant_scores], dim=1)
+            dummy_scores = torch.zeros(pruned_span_reps.size(0), 1, device=pruned_span_reps.device)
+            ant_scores_with_dummy = torch.cat([dummy_scores, ant_scores], dim=1)
 
-                triu_mask = torch.triu(torch.ones_like(ant_scores, device=ant_scores.device), diagonal=0)
+            triu_mask = torch.triu(torch.ones_like(ant_scores, device=ant_scores.device), diagonal=0)
 
-                triu_mask_extended = torch.cat([
+            triu_mask_extended = torch.cat([
                     torch.zeros(triu_mask.size(0), 1, device=triu_mask.device),  # don't mask dummy column
                     triu_mask
                 ], dim=1)
 
-                # Create sentence - based mask
-                sentence_mask = self.create_sentence_mask(
-                    pruned_indices[i], all_spans[i], sentence_map[i], sentence_starts[i]
-                )
+            # Create sentence - based mask
+            sentence_map = sentence_map.squeeze(0)
+            sentence_mask = self.create_sentence_mask(
+                    pruned_indices, all_spans, sentence_map, sentence_starts
+            )
 
-                # Combine both masks: triangular + sentence constraints
-                combined_mask = triu_mask_extended.bool() | sentence_mask
+            # Combine both masks: triangular + sentence constraints
+            combined_mask = triu_mask_extended.bool() | sentence_mask
 
-                masked_scores = ant_scores_with_dummy.masked_fill(combined_mask, -1e10)
+            masked_scores = ant_scores_with_dummy.masked_fill(combined_mask, -1e10)
 
-                # Apply regular softmax
-                softmaxed_scores = torch.nn.functional.softmax(masked_scores, dim=-1)
+            # Apply regular softmax
+            softmaxed_scores = torch.nn.functional.softmax(masked_scores, dim=-1)
 
-                # Take the log separately, avoiding log(0) issues
-                ant_scores = torch.log(softmaxed_scores + 1e-10)
-                antecedent_scores_list.append(ant_scores)
+            # Take the log separately, avoiding log(0) issues
+            ant_scores = torch.log(softmaxed_scores + 1e-10)
+
 
         if self.training:
             mention_loss = self.compute_mention_loss(mention_scores, span_starts, span_ends, cluster_ids, all_spans)
 
-            relation_loss = self.compute_coref_training_loss(
-                span_starts,
-                span_ends,
-                cluster_ids,
-                pruned_indices,
-                all_spans,
-                antecedent_scores_list
-            )
-
+            # it is not predicting any relation, at least none in the first epoch
+            #relation_loss = self.compute_coref_training_loss(
+            #    span_starts,
+            #    span_ends,
+            #    cluster_ids,
+            #    pruned_indices,
+            #    all_spans,
+            #    antecedent_scores_list
+            #)
+            relation_loss = 0
+            print(f" Mention loss: {mention_loss} Relation loss: {relation_loss}")
             return relation_loss + mention_loss
         else:
-            return antecedent_scores_list, pruned_indices, all_spans
+            return ant_scores, pruned_indices, pruned_scores, all_spans
 
     def compute_coref_training_loss(self, span_starts, span_ends, cluster_ids, pruned_indices, all_spans, antecedent_scores_list):
 
-        gold_clusters = self.extract_gold_clusters(span_starts, span_ends, cluster_ids)
-        gold_antecedents_list = []
-        for i, pruned_idxs in enumerate(pruned_indices):
-            candidate_spans = all_spans[i]
-            spans = [candidate_spans[idx] for idx in pruned_idxs]
-            span_to_index = {span: j for j, span in enumerate(spans)}
+        gold_clusters = self.extract_gold_clusters(span_starts, span_ends, cluster_ids)[0]
 
-            gold_antecedents = []
-            cluster = gold_clusters[i]
-            span_cluster_map = {}
-            for cluster_spans in cluster:
-                for span in cluster_spans:
-                    span_cluster_map[span] = cluster_spans
+        spans = [all_spans[idx] for idx in pruned_indices]
+        span_to_index = {span: j for j, span in enumerate(spans)}
 
-            for j, span in enumerate(spans):
-                ant_indices = []
-                if span in span_cluster_map:
-                    for ant in span_cluster_map[span]:
-                        if ant == span:
-                            break  # Only consider previous mentions
-                        if ant in span_to_index:
-                            ant_indices.append(span_to_index[ant])
-                gold_antecedents.append(ant_indices)
-            gold_antecedents_list.append(gold_antecedents)
+        span_cluster_map = {}
+        for cluster_spans in gold_clusters:
+            for span in cluster_spans:
+                span_cluster_map[span] = cluster_spans
 
-        coref_losses = []
-        for i, ant_scores in enumerate(antecedent_scores_list):
-            coref_loss = self.compute_coref_loss(ant_scores, gold_antecedents_list[i])
-            coref_losses.append(coref_loss)
+        gold_antecedents = []
+        for j, span in enumerate(spans):
+            ant_indices = []
+            if span in span_cluster_map:
+                for ant in span_cluster_map[span]:
+                    if ant == span:
+                        break  # Only consider previous mentions
+                    if ant in span_to_index:
+                        ant_indices.append(span_to_index[ant])
+            gold_antecedents.append(ant_indices)
 
-        avg_loss = torch.stack(coref_losses).mean()
-
-        return avg_loss
+        # Compute and return loss
+        coref_loss = self.compute_coref_loss(antecedent_scores_list, gold_antecedents)
+        return coref_loss
 
     def compute_coref_loss(self, antecedent_scores, gold_antecedents):
         loss = 0.0
@@ -376,6 +396,8 @@ class XLMRCorefModel(nn.Module):
         Returns:
             labels: tensor of shape (num_spans,) with 1 for mentions, 0 for non-mentions
         """
+
+
         labels = torch.zeros(num_spans, dtype=torch.float)
 
         # Create set of gold mention spans for fast lookup
@@ -391,42 +413,301 @@ class XLMRCorefModel(nn.Module):
 
         return labels
 
+    def get_positive_indices(self, span_starts, span_ends, cluster_ids, all_spans):
+        """More efficient version using tensor operations"""
+        positive_indices = []
+
+        # Filter out spans not in any cluster
+        valid_mask = cluster_ids != -1
+        valid_starts = span_starts[valid_mask]
+        valid_ends = span_ends[valid_mask]
+
+        # Create set of gold spans
+        gold_spans = set()
+        for start, end in zip(valid_starts, valid_ends):
+            gold_spans.add((start.item(), end.item()))
+
+        # Find matching candidate spans
+        for i, (start, end) in enumerate(all_spans):
+            if (start, end) in gold_spans:
+                positive_indices.append(i)
+
+        return torch.tensor(positive_indices, device=span_starts.device)
+
+    def hard_negative_mining(self, mention_scores, positive_indices, negative_indices, ratio=2):
+        """
+        Select hard negatives - spans that look like mentions but aren't
+        """
+        # Get scores for all negative spans
+        neg_scores = mention_scores[negative_indices]
+
+        # Sort by score (highest scoring negatives are "hardest")
+        sorted_neg_indices = negative_indices[torch.argsort(neg_scores, descending=True)]
+
+        # Take top-k hardest negatives
+        num_hard_negatives = min(len(sorted_neg_indices), len(positive_indices) * ratio)
+        hard_negatives = sorted_neg_indices[:num_hard_negatives]
+
+        return hard_negatives
+
     def compute_mention_loss(self, mention_scores_list, span_starts, span_ends, cluster_ids, all_spans):
         """Compute loss for mention detection"""
-        mention_losses = []
 
-        for i, mention_scores in enumerate(mention_scores_list):
-            # Create gold mention labels
-            gold_mentions = self.create_mention_labels(
-                len(mention_scores),
-                span_starts[i],
-                span_ends[i],
-                cluster_ids[i],
-                all_spans[i]
-            )
+        positive_indices = self.get_positive_indices(span_starts, span_ends, cluster_ids, all_spans)
+        all_indices = torch.arange(len(all_spans), device=mention_scores_list.device)
+        negative_indices = all_indices[~torch.isin(all_indices, positive_indices)]
 
-            # Move to same device as mention_scores
-            gold_mentions = gold_mentions.to(mention_scores.device)
+        sampled_indices = self.hard_negative_mining(
+            mention_scores_list, positive_indices, negative_indices, ratio=2
+        )
 
-            # Binary cross-entropy loss
-            mention_loss = F.binary_cross_entropy_with_logits(
-                mention_scores.squeeze(-1), gold_mentions
-            )
-            mention_losses.append(mention_loss)
+        sampled_labels = torch.zeros(len(sampled_indices), device=mention_scores_list.device)
+        sampled_labels[:len(positive_indices)] = 1.0  # First len(positive_indices) are positive
 
-        return torch.stack(mention_losses).mean()
+        sampled_scores = mention_scores_list[sampled_indices]
+        loss = F.binary_cross_entropy_with_logits(sampled_scores, sampled_labels)
 
+        return  loss
 
-    @torch.no_grad()
-    def predict(self, input_ids, attention_mask, edges):
+    def inference(self, input_ids, attention_mask=None, edges=None,
+                  sentence_map=None, sentence_starts=None, threshold=0.5):
+        """
+        Perform inference to get coreference clusters
+
+        Args:
+            input_ids: Tensor of tokenized input
+            attention_mask: Tensor of attention mask
+            edges: list of edge lists for GCN
+            sentence_map: mapping from tokens to sentences
+            sentence_starts: sentence start positions
+            threshold: threshold for mention selection (default: 0.5)
+
+        Returns:
+            clusters: List of clusters, where each cluster is a list of spans
+            mentions: List of all detected mentions
+        """
+        # Set model to evaluation mode
         self.eval()
+
         with torch.no_grad():
-            antecedent_scores_list, pruned_indices_list, all_spans_list = self.forward(input_ids=input_ids, attention_mask=attention_mask, edges=edges)
-        for antecedent_scores, pruned_indices, all_spans in zip(antecedent_scores_list, pruned_indices_list,
-                                                                all_spans_list):
-            pruned_spans = [all_spans[i] for i in pruned_indices]
-            clusters = decode_clusters(pruned_spans, antecedent_scores)
+            # Get model outputs
+            antecedent_scores_list, pruned_indices, mention_scores, all_spans = self.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                edges=edges,
+                sentence_map=sentence_map,
+                sentence_starts=sentence_starts
+            )
+
+
+            clusters, mentions, scores = self._decode_clusters(
+                  antecedent_scores_list,
+                  pruned_indices,
+                  all_spans,
+                  mention_scores,
+                  mention_threshold=threshold
+            )
+
+            return clusters, mentions, scores
+
+    def _decode_clusters(self, antecedent_scores, pruned_indices, all_spans,
+                         mention_scores=None, mention_threshold=0.5):
+        """
+        Decode antecedent scores into coreference clusters with mention filtering
+
+        Args:
+            antecedent_scores: (num_spans, num_spans + 1) antecedent scores
+            pruned_indices: indices of pruned spans
+            all_spans: all candidate spans
+            mention_scores: actual mention scores from mention_scorer (optional)
+            mention_threshold: threshold for mention detection
+
+        Returns:
+            clusters: List of clusters
+            mentions: List of detected mentions
+        """
+        # Get spans for pruned indices
+        pruned_spans = [all_spans[i] for i in pruned_indices]
+
+        # Filter by mention scores
+        if mention_scores is not None:
+            # Use actual mention scores
+            mention_probs = torch.sigmoid(mention_scores.squeeze(-1))
+            mention_mask = mention_probs.squeeze(-1) > mention_threshold
+        else:
+            # Fallback to deriving from antecedent scores
+            antecedent_scores = torch.stack(antecedent_scores)
+            probs = torch.exp(antecedent_scores)
+            mention_probs = 1 - probs[:, 0]
+            mention_mask = mention_probs > mention_threshold
+
+        valid_indices = torch.where(mention_mask)[0]
+
+        if len(valid_indices) == 0:
+            return [], [], []
+
+        # Get valid spans
+        valid_spans = [pruned_spans[i] for i in valid_indices]
+        valid_scores = mention_probs[valid_indices].cpu().numpy().tolist()
+
+        # Filter antecedent scores to only include valid mentions
+        filtered_antecedent_scores = antecedent_scores[valid_indices]
+
+        # Build clusters using filtered spans
+        clusters = self._build_clusters(
+            filtered_antecedent_scores,
+            valid_indices,
+            valid_spans
+        )
+
+        return clusters, valid_spans, valid_scores
+
+    def _build_clusters(self, antecedent_scores, mention_indices, spans):
+        """
+        Build coreference clusters from antecedent scores
+
+        Args:
+            antecedent_scores: scores for valid mentions only
+            mention_indices: indices of valid mentions
+            spans: corresponding spans
+
+        Returns:
+            clusters: List of clusters
+        """
+        # Create mapping from original indices to filtered indices
+        index_map = {orig_idx.item(): new_idx for new_idx, orig_idx in enumerate(mention_indices)}
+
+        # Find best antecedent for each mention
+        antecedent_links = {}
+
+        for i, scores in enumerate(antecedent_scores):
+            # Skip dummy antecedent (index 0)
+            ant_scores = scores[1:]  # Remove dummy column
+
+            if len(ant_scores) == 0:
+                continue
+
+            # Only consider antecedents that come before current mention
+            valid_antecedents = ant_scores[:i]  # Only previous mentions
+
+            if len(valid_antecedents) == 0:
+                continue
+
+            # Find best antecedent
+            best_ant_rel_idx = torch.argmax(valid_antecedents).item()
+            best_score = valid_antecedents[best_ant_rel_idx].item()
+
+            # Only create link if score is reasonable (not too low)
+            if best_score > -5.0:  # Adjust threshold as needed
+                antecedent_links[i] = best_ant_rel_idx
+
+        # Build clusters using Union-Find
+        clusters = self._union_find_clustering(antecedent_links, len(spans))
+
+        # Convert cluster indices to actual spans
+        span_clusters = []
+        for cluster in clusters:
+            span_cluster = [spans[i] for i in cluster]
+            span_clusters.append(span_cluster)
+
+        return span_clusters
+
+    def _union_find_clustering(self, antecedent_links, num_mentions):
+        """
+        Use Union-Find to build clusters from antecedent links
+
+        Args:
+            antecedent_links: dict mapping mention -> antecedent
+            num_mentions: total number of mentions
+
+        Returns:
+            clusters: List of clusters (each cluster is a list of mention indices)
+        """
+        # Initialize parent array for Union-Find
+        parent = list(range(num_mentions))
+
+        def find(x):
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+
+        def union(x, y):
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        # Union mentions based on antecedent links
+        for mention, antecedent in antecedent_links.items():
+            union(mention, antecedent)
+
+        # Group mentions by their root parent
+        clusters_dict = defaultdict(list)
+        for i in range(num_mentions):
+            root = find(i)
+            clusters_dict[root].append(i)
+
+        # Convert to list of clusters (filter out singleton clusters if desired)
+        clusters = [cluster for cluster in clusters_dict.values() if len(cluster) > 1]
+
         return clusters
+
+    def predict_batch(self, batch_data, tokenizer, threshold=0.5):
+        """
+        Convenient method for batch prediction
+
+        Args:
+            batch_data: dict containing input_ids, attention_mask, edges, etc.
+            tokenizer: the model tokenizer to decode to text
+            threshold: mention detection threshold
+
+        Returns:
+            predictions: List of predictions for each document
+        """
+        input_ids = batch_data['input_ids']
+        attention_mask = batch_data.get('attention_mask')
+        edges = batch_data.get('edges')
+        sentence_map = batch_data.get('sentence_map')
+        sentence_starts = batch_data.get('sentence_starts')
+
+        clusters_list, mentions_list, mention_scores_list = self.inference(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            edges=edges,
+            sentence_map=sentence_map,
+            sentence_starts=sentence_starts,
+            threshold=threshold
+        )
+
+        predictions = []
+        for idx, cluster in enumerate(clusters_list):
+            sorted_spans = sorted(cluster)
+
+            mentions_with_text = []
+            for mention_span, score in zip(mentions_list, mention_scores_list):
+                idx_span = bisect_left(sorted_spans, mention_span)
+                idx_span = idx_span if idx_span < len(sorted_spans) else idx_span - 1
+
+                # this spans do not belong to this cluster
+                if sorted_spans[idx_span] != mention_span:
+                    continue
+                start_idx, end_idx = mention_span
+                # Extract tokens and decode to text
+                mention_tokens = input_ids[0,start_idx:end_idx + 1]
+                mention_text = tokenizer.decode(mention_tokens, skip_special_tokens=True)
+
+                mentions_with_text.append({
+                    'span': mention_span,
+                    'text': mention_text.strip(),
+                    'score': score
+                })
+
+
+            predictions.append({
+                'cluster_id': idx,
+                'mentions_txt':mentions_with_text
+            })
+
+        return predictions
 
 
 class SpanRepresentation(nn.Module):
@@ -443,25 +724,21 @@ class SpanRepresentation(nn.Module):
             span_representations: list of tensors, one per example (num_spans_i, 3 * hidden)
         """
         span_reps = []
+        for start, end in all_spans:
+            span_emb = embeddings[0, start:end+1]  # (span_len, hidden)
+            start_emb = embeddings[0, start]       # (hidden)
+            end_emb = embeddings[0, end]           # (hidden)
 
-        for i, spans in enumerate(all_spans):  # Iterate over batch
-            ex_span_reps = []
-            for start, end in spans:
-                span_emb = embeddings[i, start:end+1]  # (span_len, hidden)
-                start_emb = embeddings[i, start]       # (hidden)
-                end_emb = embeddings[i, end]           # (hidden)
+             # Attention-based pooling over the span
+            attn_scores = self.attention(span_emb)            # (span_len, 1)
+            attn_weights = torch.softmax(attn_scores, dim=0)  # (span_len, 1)
+            attn_output = torch.sum(attn_weights * span_emb, dim=0)  # (hidden)
 
-                # Attention-based pooling over the span
-                attn_scores = self.attention(span_emb)            # (span_len, 1)
-                attn_weights = torch.softmax(attn_scores, dim=0)  # (span_len, 1)
-                attn_output = torch.sum(attn_weights * span_emb, dim=0)  # (hidden)
+            span_vec = torch.cat([start_emb, end_emb, attn_output], dim=-1)  # (3 * hidden)
 
-                span_vec = torch.cat([start_emb, end_emb, attn_output], dim=-1)  # (3 * hidden)
-                ex_span_reps.append(span_vec)
+            span_reps.append(span_vec)  # (num_spans, 3 * hidden)
 
-            span_reps.append(torch.stack(ex_span_reps))  # (num_spans, 3 * hidden)
-
-        return span_reps
+        return torch.stack(span_reps)
 
 
 class MentionScorer(nn.Module):
@@ -474,6 +751,6 @@ class MentionScorer(nn.Module):
         )
 
     def forward(self, span_reps):
-        mention_scores = [self.scorer(rep).squeeze(-1) for rep in span_reps]
+        mention_scores = self.scorer(span_reps).squeeze(-1)  # (num_spans,)
         return mention_scores
 

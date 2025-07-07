@@ -95,7 +95,7 @@ class CoreferenceDataset(Dataset):
             "span_starts": torch.tensor(span_starts),
             "span_ends": torch.tensor(span_ends),
             "cluster_ids": torch.tensor(cluster_ids),
-            "sentence_map": torch.tensor(example.get("sentence_map")),
+            "sentence_map": torch.tensor(example.get("sentence_map")).squeeze(0),
             "sentence_starts": torch.tensor(example.get("sentence_starts")),
             "lang": example["lang"]
         }

@@ -27,9 +27,9 @@ print(f"Loaded train and validation dataset in {time.time() - start} seconds")
 
 # TOD: determine a confif file with:
 config = {}
-config["span_width"] = 30
+config["span_width"] = 10
 config["combine_strategy"] = "concat"
-num_epochs = 2
+num_epochs = 10
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 xlmr_model = model.XLMRCorefModel(config, num_labels=len(DEPENDENCY_LABELS)).to(device) # combine_strategy = add or concat
@@ -50,6 +50,7 @@ if do_train:
         total_train_loss = 0
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training")):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
             optimizer.zero_grad()
             loss = xlmr_model(
                 input_ids=batch['input_ids'],
@@ -62,28 +63,25 @@ if do_train:
                 sentence_starts=batch['sentence_starts']
             )
             loss.backward()
-            # checking the gradients
-            #for name, param in xlmr_model.named_parameters():
-            #    if param.grad is not None:
-            #        print(f"{name}: grad_norm = {param.grad.norm().item():.6f}")
-            #    else:
-            #        print(f"{name}: NO GRADIENTS!")
+
             torch.nn.utils.clip_grad_norm_(xlmr_model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
 
             total_train_loss += loss.item()
-            if (batch_idx + 1) % 10 == 0:
-                print(f"  Batch {batch_idx + 1}/{len(dataloader)}, Loss: {loss.item():.4f}")
+            print(f"Loss: {loss.item():.4f}")
+
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': xlmr_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': loss,
+            }, f'checkpoints/xlmr_coref_checkpoint.pt')
 
 #        avg_train_loss = total_train_loss / len(dataloader)
 #        print(f"  Average training loss: {avg_train_loss:.4f}")
-#        torch.save({
-#            'epoch': epoch,
-#            'model_state_dict': xlmr_model.state_dict(),
-#            'optimizer_state_dict': optimizer.state_dict(),
-#            'loss': loss,
-#        }, f'checkpoints/xlmr_coref_checkpoint_{epoch}.pt')
+    # save the last model
+
 #else:
 #    start = time.time()
 #    checkpoint_path = os.path.join("checkpoints","xlmr_coref_checkpoint_0.pt")
